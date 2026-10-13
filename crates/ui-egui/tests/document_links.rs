@@ -424,7 +424,8 @@ fn an_absolute_gotor_waits_for_consent_and_keeps_its_destination_across_tabs() {
     assert!(h.state().toast.is_none(), "the nonexistent target is not accessed before consent");
     assert!(h.state().password_prompt.is_none());
     // The target only appears AFTER the confirmation is displayed.
-    std::fs::write(&target, linked_pages(2, None)).unwrap();
+    let target_bytes = linked_pages(2, None);
+    std::fs::write(&target, &target_bytes).unwrap();
     h.state_mut().open_bytes("other.pdf", None, fixture()).unwrap();
     assert_eq!(h.state().active, Some(1));
     h.run_steps(3);
@@ -437,7 +438,7 @@ fn an_absolute_gotor_waits_for_consent_and_keeps_its_destination_across_tabs() {
     assert_eq!(h.state().active, Some(2));
     let target_doc = h.state().session.get(h.state().views[2].id).unwrap();
     assert_eq!(target_doc.path.as_deref(), Some(file));
-    assert_eq!(target_doc.bytes.as_slice(), linked_pages(2, None).as_slice());
+    assert_eq!(target_doc.bytes.as_slice(), target_bytes.as_slice());
     assert!(!h.state().session.get(source).unwrap().dirty);
     assert_eq!(h.state().last_opened_url, None);
     std::fs::remove_dir_all(dir).unwrap();
@@ -484,25 +485,43 @@ fn consenting_to_absolute_gotor_still_validates_the_target() {
     std::fs::write(dir.join("notes.txt"), b"text").unwrap();
     std::fs::write(dir.join("broken.pdf"), b"not a PDF").unwrap();
     #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut cases = vec!["missing.pdf", "folder.pdf", "notes.txt", "broken.pdf"];
+    let mut cases = vec![
+        ("missing.pdf", "Couldn't follow linked PDF: the linked file couldn't be read:"),
+        ("folder.pdf", "Couldn't follow linked PDF: the linked path is not a regular file"),
+        ("notes.txt", "Couldn't follow linked PDF: the linked file is not a .pdf file"),
+        ("broken.pdf", "Couldn't open broken.pdf: the file is not a readable PDF:"),
+    ];
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink("/dev/zero", dir.join("zero.pdf")).unwrap();
-        cases.push("zero.pdf");
+        cases.push(("zero.pdf", "Couldn't follow linked PDF: the linked path is not a regular file"));
         std::fs::File::create(dir.join("large.pdf")).unwrap().set_len(pdfcraft_engine::MAX_REMOTE_DOCUMENT_BYTES + 1).unwrap();
-        cases.push("large.pdf");
+        cases.push(("large.pdf", "Couldn't follow linked PDF: the linked file is too large to open"));
     }
-    for name in cases {
+    for (name, expected_error) in cases {
         let target = dir.join(name);
         let mut h = remote_harness(None, target.to_str().unwrap(), "[0 /Fit]");
+        let source = h.state().views[0].id;
+        let before = h.state().session.get(source).unwrap().bytes.clone();
         click_remote_link(&mut h);
         assert!(h.state().pending_remote_link.is_some());
         assert!(h.state().toast.is_none(), "{name} isn't checked before consent");
         h.get_by_label("Allow").click();
-        h.run_steps(3);
+        support::wait_until(&mut h, "approved invalid target refusal", |app| {
+            app.toast.as_ref().is_some_and(|(message, _)| message.starts_with(expected_error))
+        });
         assert!(h.state().pending_remote_link.is_none());
         assert_eq!(h.state().views.len(), 1, "{name}");
         assert!(h.state().toast.is_some(), "{name} is refused after consent");
+        assert_eq!(h.state().session.docs().len(), 1);
+        assert_eq!(h.state().active_ids().map(|(_, id)| id), Some(source));
+        assert_eq!(h.state().views[0].current, 0);
+        let doc = h.state().session.get(source).unwrap();
+        assert_eq!(doc.bytes, before);
+        assert!(!doc.dirty);
+        assert!(doc.can_undo().is_none());
+        assert!(h.state().password_prompt.is_none());
+        assert!(h.state().last_opened_url.is_none());
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
