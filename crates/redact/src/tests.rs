@@ -959,7 +959,7 @@ fn a_scanned_page_keeps_its_image_and_loses_the_text_under_the_mark() {
     // image — pixels 16–23 on both axes; the text mark covers R1234, x 20–40.
     let img = stream(
         "/Type /XObject /Subtype /Image /Width 40 /Height 40 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
-        &jpeg_white(40, 40),
+        jpeg_white(40, 40),
     );
     let src = b"q 100 0 0 100 10 10 cm /Im1 Do Q BT /F1 10 Tf 10 200 Td (OCR1234) Tj ET";
     let mut doc = one_page(src, "/XObject << /Im1 7 0 R >>", vec![img]);
@@ -994,6 +994,92 @@ fn a_scanned_page_keeps_its_image_and_loses_the_text_under_the_mark() {
     assert_eq!(page_image(&saved, 0).map(|(w, h, _)| (w, h)), Some((40, 40)));
     assert_eq!(under(&mut saved, 0, &[[20.5, 195.0, 24.5, 210.0]]), 0);
     assert!(!content(&saved, 0).contains("0031"));
+}
+
+/// A redaction mark over a **rotated** scan must still clear the covered pixels. `row_hits` builds
+/// the bounding box of each transformed sample row; with a 90° `cm`, every row is vertical (zero
+/// X extent) and `overlaps` — strict in both axes — used to skip them all, leaving the original
+/// JPEG (and its content under the mark) untouched while the overlay made it *look* redacted.
+/// The row skip must be conservative for degenerate rows on either axis.
+#[test]
+fn a_rotated_scan_is_still_cleared_under_the_mark() {
+    // The same 40×40 white JPEG, drawn 100×100 at (10,10) but rotated 90°:
+    // `q 0 100 -100 0 110 10 cm` maps the image square to (10,10)-(110,110) sideways.
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 40 /Height 40 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+        jpeg_white(40, 40),
+    );
+    let src = b"q 0 100 -100 0 110 10 cm /Im1 Do Q";
+    let mut doc = one_page(src, "/XObject << /Im1 7 0 R >>", vec![img]);
+    mark(&mut doc, 0, &[[50.0, 50.0, 70.0, 70.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.images_removed, r.images_cleared), (0, 1), "the rotated scan is cleared in place, never removed: {r:?}");
+
+    let (w, h, px) = page_image(&doc, 0).expect("the cleared image copy is there");
+    assert_eq!((w, h), (40, 40));
+    let at = |i: u32, j: u32| &px[((j * 40 + i) * 3) as usize..][..3];
+    // The mark covers 20 pt = 8 image pixels; under the rotated CTM the covered sample block is
+    // still the middle 8×8 (the rotation is about the square's centre), so the same pixels must
+    // be black now as in the unrotated case.
+    for (i, j) in [(16, 16), (20, 20), (23, 23), (18, 21)] {
+        assert!(at(i, j).iter().all(|&b| b < 96), "the marked pixels are black at ({i},{j}): {:?}", at(i, j));
+    }
+    for (i, j) in [(0, 0), (39, 0), (0, 39), (39, 39), (2, 20), (37, 20)] {
+        assert!(at(i, j).iter().all(|&b| b > 160), "the rest of the scan survives at ({i},{j}): {:?}", at(i, j));
+    }
+}
+
+/// A grayscale scan with an explicit identity `/Decode [0 1]` is cleared in place too — the
+/// component count of the `/Decode` check must be the image's own (one), not three, or every
+/// explicit-declaration gray scan would be removed whole and the page blanked again.
+#[test]
+fn a_gray_scan_with_an_identity_decode_is_cleared_not_removed() {
+    let mut gray = vec![200u8; 20 * 20];
+    gray[..20].fill(20);
+    let mut jpeg = Vec::new();
+    ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90).encode(&gray, 20, 20, ::image::ExtendedColorType::L8).unwrap();
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 20 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [0 1] /Filter /DCTDecode",
+        &jpeg,
+    );
+    let mut doc = one_page(b"q 100 0 0 100 10 10 cm /Im0 Do Q", "/XObject << /Im0 7 0 R >>", vec![img]);
+    mark(&mut doc, 0, &[[40.0, 40.0, 60.0, 60.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.images_removed, r.images_cleared), (0, 1), "the gray scan is cleared, not removed: {r:?}");
+}
+
+/// A gray scan with an *inverted* `/Decode [1 0]` still fails closed: cleared samples would paint
+/// white on an inverted image, so the whole image goes instead.
+#[test]
+fn a_gray_scan_with_an_inverted_decode_still_fails_closed() {
+    let gray = vec![200u8; 20 * 20];
+    let mut jpeg = Vec::new();
+    ::image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90).encode(&gray, 20, 20, ::image::ExtendedColorType::L8).unwrap();
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 20 /Height 20 /ColorSpace /DeviceGray /BitsPerComponent 8 /Decode [1 0] /Filter /DCTDecode",
+        &jpeg,
+    );
+    let mut doc = one_page(b"q 100 0 0 100 10 10 cm /Im0 Do Q", "/XObject << /Im0 7 0 R >>", vec![img]);
+    mark(&mut doc, 0, &[[40.0, 40.0, 60.0, 60.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!(r.images_removed, 1, "the inverted scan is removed whole: {r:?}");
+    assert!(!content(&doc, 0).contains("/Im0"));
+}
+
+/// A mark that only clips the image's edge — too thin to contain any pixel centre — must not
+/// leave the original image untouched behind the overlay: the image is removed whole instead.
+#[test]
+fn an_edge_sliver_mark_fails_closed_instead_of_leaving_the_image() {
+    let img = stream(
+        "/Type /XObject /Subtype /Image /Width 40 /Height 40 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode",
+        jpeg_white(40, 40),
+    );
+    // Drawn at (10,10)-(110,110): a mark from x=10 to x=10.5 overlaps the first column's
+    // footprint, but its centre (x=11.25) is outside — no pixel would be cleared.
+    let mut doc = one_page(b"q 100 0 0 100 10 10 cm /Im1 Do Q", "/XObject << /Im1 7 0 R >>", vec![img]);
+    mark(&mut doc, 0, &[[10.0, 10.0, 10.5, 110.0]], "");
+    let r = apply(&mut doc, None).unwrap();
+    assert_eq!((r.images_removed, r.images_cleared), (1, 0), "an image the mark touches is never left as-is: {r:?}");
 }
 
 /// An image whose codec PdfCraft cannot clear in place (a JBIG2 fax scan, say) still fails closed:

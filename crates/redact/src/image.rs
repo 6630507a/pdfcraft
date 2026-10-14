@@ -69,11 +69,20 @@ fn filter_chain(s: &Stream) -> Option<Vec<Vec<u8>>> {
 
 /// Is a pixel's sample row, at row `j` of `h`, anywhere near a region? The image is walked row by
 /// row, so the whole rows outside every region are skipped without touching a pixel.
+///
+/// A degenerate row (zero extent on either axis — a 90° rotation makes every row vertical, a
+/// flip makes them horizontal, skew can collapse one) must *not* be skipped: `overlaps` is
+/// strict in both axes, so a zero-width box would fail it and the mark would be silently ignored
+/// while the image survived untouched. When either axis of the transformed row is degenerate the
+/// conservative answer is "run the per-pixel test".
 fn row_hits(ctm: &Matrix, h: usize, j: usize, rects: &[[f64; 4]]) -> bool {
     let v = 1.0 - (j as f64 + 0.5) / h as f64;
     let (ax, ay) = ctm.apply(0.0, v);
     let (bx, by) = ctm.apply(1.0, v);
     let row = [ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)];
+    if (row[2] - row[0]).abs() < f64::EPSILON || (row[3] - row[1]).abs() < f64::EPSILON {
+        return true;
+    }
     rects.iter().any(|r| overlaps(*r, [row[0], row[1] - 0.01, row[2], row[3] + 0.01], 0.0))
 }
 
@@ -111,6 +120,22 @@ struct Jpeg {
     ncomp: usize,
 }
 
+/// Does any region's rectangle intersect the image's transformed unit square? (Conservative:
+/// a mark that only clips the square's edge still counts — the per-pixel centre test may find
+/// no sample centre inside such a sliver, and an image the mark touches must not survive as-is.)
+fn image_touched(ctm: &Matrix, rects: &[[f64; 4]]) -> bool {
+    let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)];
+    let mut box_ = [f64::INFINITY, f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for (u, v) in corners {
+        let (x, y) = ctm.apply(u, v);
+        box_[0] = box_[0].min(x);
+        box_[1] = box_[1].min(y);
+        box_[2] = box_[2].max(x);
+        box_[3] = box_[3].max(y);
+    }
+    rects.iter().any(|r| overlaps(*r, box_, 0.0))
+}
+
 fn jpeg_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]], w: usize, h: usize) -> Option<Option<Stream>> {
     let Jpeg { mut px, space, ncomp } = decode_jpeg(doc, s, w, h)?;
     let mut cleared = 0usize;
@@ -130,6 +155,14 @@ fn jpeg_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]], w: u
         }
     }
     if cleared == 0 {
+        // A mark that intersects the image (its unit square) but clears no pixel centre — an
+        // edge-only overlap, or a mark thinner than one pixel footprint — must not leave the
+        // original untouched: the overlay hides it visually, but the samples survive. Fail
+        // closed; the caller removes the image whole. (A mark entirely outside the image is
+        // the legitimate `Ok(None)` case.)
+        if image_touched(ctm, rects) {
+            return None;
+        }
         return Some(None);
     }
     let encoded = encode_jpeg(&px, w, h, space)?;
@@ -159,15 +192,23 @@ fn decode_jpeg(doc: &Document, s: &Stream, w: usize, h: usize) -> Option<Jpeg> {
         3 => ColorType::Rgb8,
         _ => return None,
     };
-    if !identity_decode(doc, s, 3) {
+    // `/Decode` must match the *image's* component count (one for DeviceGray, three for RGB):
+    // a gray scan with an identity `/Decode [0 1]` would otherwise fail the check and be
+    // removed whole — the very blanking this fix exists to prevent.
+    if !identity_decode(doc, s, if space == ColorType::L8 { 1 } else { 3 }) {
+        return None;
+    }
+    // The JPEG header is inspected *before* the sample allocation: a dictionary that declares a
+    // small image but carries a much larger JPEG must not be decoded first — the crate's
+    // `MAX_PIXELS` cap is enforced against the header, and only then are the samples decoded.
+    let reader = image::ImageReader::with_format(std::io::Cursor::new(s.raw.as_ref()), ImageFormat::Jpeg);
+    let (iw, ih) = reader.into_dimensions().ok()?;
+    if (iw as usize, ih as usize) != (w, h) {
         return None;
     }
     let reader = image::ImageReader::with_format(std::io::Cursor::new(s.raw.as_ref()), ImageFormat::Jpeg);
     let decoded = reader.decode().ok()?;
-    let (iw, ih) = (decoded.width() as usize, decoded.height() as usize);
-    if iw != w || ih != h {
-        return None;
-    }
+    debug_assert_eq!((decoded.width() as usize, decoded.height() as usize), (w, h));
     let (px, ncomp) = match space {
         ColorType::L8 => (decoded.into_luma8().into_raw(), 1),
         _ => (decoded.into_rgb8().into_raw(), 3),
@@ -228,6 +269,11 @@ fn raw_clear(doc: &Document, s: &Stream, ctm: &Matrix, rects: &[[f64; 4]], w: us
         }
     }
     if cleared == 0 {
+        // Same fail-closed rule as the JPEG path: a mark that touches this image but whose
+        // rectangle covers no sample centre (an edge sliver) removes the image whole.
+        if image_touched(ctm, rects) {
+            return None;
+        }
         return Some(None);
     }
     let mut dict = s.dict.clone();
