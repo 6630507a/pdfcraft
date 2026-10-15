@@ -11,7 +11,7 @@ use crate::{Compression, ImageSettings, OptimizeError, Report, Settings, Stage};
 const MAX_PIXELS: u64 = 80_000_000;
 
 /// The resources of a page, inherited from the page tree if the page has none.
-fn page_resources(doc: &Document, page: ObjRef) -> Option<Dict> {
+pub(crate) fn page_resources(doc: &Document, page: ObjRef) -> Option<Dict> {
     let mut node = Some(page);
     for _ in 0..64 {
         let d = doc.get(node?).as_dict()?.clone();
@@ -23,7 +23,7 @@ fn page_resources(doc: &Document, page: ObjRef) -> Option<Dict> {
     None
 }
 
-fn content_bytes(doc: &Document, contents: &Object) -> Vec<u8> {
+pub(crate) fn content_bytes(doc: &Document, contents: &Object) -> Vec<u8> {
     match &*doc.resolve(contents) {
         Object::Stream(s) => s.decoded().unwrap_or_default(),
         Object::Array(a) => a
@@ -111,7 +111,7 @@ pub fn effective_resolutions(doc: &Document, pages: &[ObjRef]) -> HashMap<ObjRef
 }
 
 /// Colour components of a colour space PdfCraft resamples: gray (1) or RGB (3).
-fn components(doc: &Document, cs: &Object) -> Option<usize> {
+pub(crate) fn components(doc: &Document, cs: &Object) -> Option<usize> {
     let cs = doc.resolve(cs);
     match &*cs {
         Object::Name(n) => match n.as_slice() {
@@ -179,7 +179,7 @@ fn is_dct(s: &Stream) -> Option<bool> {
 }
 
 /// 8-bit samples of an image (`n` components), decoded.
-fn pixels(s: &Stream, n: usize) -> Option<Vec<u8>> {
+pub(crate) fn pixels(s: &Stream, n: usize) -> Option<Vec<u8>> {
     let (w, h) = (s.dict.int(b"Width")? as usize, s.dict.int(b"Height")? as usize);
     if is_dct(s)? {
         let img = image::load_from_memory_with_format(&s.raw, image::ImageFormat::Jpeg).ok()?;
@@ -192,7 +192,7 @@ fn pixels(s: &Stream, n: usize) -> Option<Vec<u8>> {
     }
 }
 
-fn resample(px: &[u8], n: usize, w: u32, h: u32, nw: u32, nh: u32) -> Option<Vec<u8>> {
+pub(crate) fn resample(px: &[u8], n: usize, w: u32, h: u32, nw: u32, nh: u32) -> Option<Vec<u8>> {
     use image::imageops::{FilterType, resize};
     Some(match n {
         1 => resize(&image::GrayImage::from_raw(w, h, px.to_vec())?, nw, nh, FilterType::CatmullRom).into_raw(),
@@ -208,10 +208,26 @@ fn jpeg(px: &[u8], n: usize, w: u32, h: u32, quality: u8) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Whether [`pixels`] reads `s` as it is drawn: a codec it decodes and no decode array that
+/// changes anything. `None` when the colour space isn't grey or RGB.
+pub(crate) fn decodable(doc: &Document, s: &Stream) -> Option<bool> {
+    let n = components(doc, s.dict.get(b"ColorSpace")?)?;
+    Some(is_dct(s).is_some() && s.dict.get(b"Decode").is_none_or(|d| is_identity_decode(doc, d, n)))
+}
+
+/// Whether `decode` is the default decode array for `n` components ([0 1] each), which changes
+/// nothing. Scanners write it on page images (#490).
+fn is_identity_decode(doc: &Document, decode: &Object, n: usize) -> bool {
+    let decode = doc.resolve(decode);
+    let Some(a) = decode.as_array() else { return false };
+    a.len() == 2 * n && a.chunks(2).all(|p| matches!(p, [lo, hi] if doc.resolve(lo).as_f64() == Some(0.0) && doc.resolve(hi).as_f64() == Some(1.0)))
+}
+
 /// A new image stream from 8-bit samples: the original dictionary with the new size and filter.
+/// A decode array is dropped: only images without one, or with the default one, get here.
 fn image_stream(old: &Dict, px: &[u8], n: usize, w: u32, h: u32, compression: Compression, was_dct: bool) -> Option<Stream> {
     let mut d = old.clone();
-    for k in [&b"Filter"[..], b"DecodeParms", b"Length", b"DL"] {
+    for k in [&b"Filter"[..], b"DecodeParms", b"Decode", b"Length", b"DL"] {
         d.remove(k);
     }
     d.set(b"Width".to_vec(), Object::Int(w as i64));
@@ -239,7 +255,11 @@ fn image_stream(old: &Dict, px: &[u8], n: usize, w: u32, h: u32, compression: Co
 /// Returns the new image and its new soft mask, if the result is smaller.
 fn process(doc: &Document, s: &Stream, ppi: f64, settings: &ImageSettings, n: usize) -> Option<(Stream, Option<(ObjRef, Stream)>)> {
     let d = &s.dict;
-    if d.contains(b"Decode") || d.contains(b"Mask") || d.name(b"ImageMask").is_some() || matches!(d.get(b"ImageMask"), Some(Object::Bool(true))) {
+    if d.get(b"Decode").is_some_and(|a| !is_identity_decode(doc, a, n))
+        || d.contains(b"Mask")
+        || d.name(b"ImageMask").is_some()
+        || matches!(d.get(b"ImageMask"), Some(Object::Bool(true)))
+    {
         return None;
     }
     if d.int(b"BitsPerComponent") != Some(8) {

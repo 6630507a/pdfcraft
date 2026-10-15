@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use egui::{Align, Layout};
-use pdfcraft_engine::optimize::{Compression, ImageSettings, QUALITIES, Settings};
+use pdfcraft_engine::optimize::{Compression, ImageSettings, Preset, QUALITIES, Settings};
 use pdfcraft_engine::optimizer::{OptimizeStage, Optimized};
 use pdfcraft_engine::{DocId, EditError, Hidden, OptimizeReport};
 
@@ -60,7 +60,7 @@ pub enum OptimizeKind {
 
 impl OptimizeKind {
     /// The suffix of the saved copy's name ("notes (reduced).pdf").
-    fn suffix(self) -> &'static str {
+    pub(crate) fn suffix(self) -> &'static str {
         match self {
             OptimizeKind::Reduce => "reduced",
             OptimizeKind::Advanced => "optimized",
@@ -78,6 +78,7 @@ pub struct OptimizeRun {
 fn stage_label(stage: OptimizeStage) -> String {
     match stage {
         OptimizeStage::Discarding => tl!("Optimizing… removing user data").to_string(),
+        OptimizeStage::Fragments => tl!("Optimizing… merging image fragments").to_string(),
         OptimizeStage::Images { done, total } => crate::i18n::fmt(
             tl!("Optimizing… image {d} of {t}"),
             &[("d", &(done + 1).min(total.max(1)).to_string()), ("t", &total.max(1).to_string())],
@@ -91,17 +92,15 @@ fn stage_label(stage: OptimizeStage) -> String {
 /// What the saved notice adds after the size: images optimized and items discarded.
 fn summary(r: &OptimizeReport) -> String {
     let o = &r.optimize;
+    let lang = crate::i18n::current();
     let mut parts = Vec::new();
-    if o.images_resampled + o.images_recompressed > 0 {
-        parts.push(format!(
-            "{} image{} optimized",
-            o.images_resampled + o.images_recompressed,
-            if o.images_resampled + o.images_recompressed == 1 { "" } else { "s" }
-        ));
+    let images = o.images_resampled + o.images_recompressed;
+    if images > 0 {
+        parts.push(crate::i18n::trn(lang, images as u64, "{n} image optimized", "{n} images optimized"));
     }
     let discarded: usize = r.discarded.iter().map(|(_, n)| n).sum();
     if discarded > 0 {
-        parts.push(format!("{discarded} item{} discarded", if discarded == 1 { "" } else { "s" }));
+        parts.push(crate::i18n::trn(lang, discarded as u64, "{n} item discarded", "{n} items discarded"));
     }
     if parts.is_empty() { String::new() } else { format!("; {}", parts.join(", ")) }
 }
@@ -109,7 +108,7 @@ fn summary(r: &OptimizeReport) -> String {
 fn image_row(ui: &mut egui::Ui, id: &str, title: &str, s: &mut ImageSettings) {
     ui.label(egui::RichText::new(tl!(title)).font(theme::semibold(13.0)));
     ui.horizontal(|ui| {
-        ui.checkbox(&mut s.downsample, tl!("Bicubic downsampling to"));
+        ui.add(widgets::checkbox(&mut s.downsample, tl!("Bicubic downsampling to")));
         ui.add_enabled(s.downsample, egui::DragValue::new(&mut s.target_ppi).range(9.0..=2400.0).suffix(" ppi"));
         ui.label(tl!("for images above"));
         ui.add_enabled(s.downsample, egui::DragValue::new(&mut s.above_ppi).range(9.0..=2400.0).suffix(" ppi"));
@@ -146,7 +145,7 @@ fn image_row(ui: &mut egui::Ui, id: &str, title: &str, s: &mut ImageSettings) {
 
 fn discard_box(ui: &mut egui::Ui, list: &mut Vec<Hidden>, h: Hidden, label: &str) {
     let mut on = list.contains(&h);
-    if ui.checkbox(&mut on, tl!(label)).changed() {
+    if ui.add(widgets::checkbox(&mut on, tl!(label))).changed() {
         if on {
             list.push(h);
         } else {
@@ -160,6 +159,22 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
     ui.label(egui::RichText::new(tl!("PDF Optimizer")).font(theme::semibold(18.0)));
     ui.add_space(6.0);
     ui.horizontal(|ui| {
+        ui.label(tl!("Settings"));
+        let name = |p: Preset| match p {
+            Preset::Standard => tl!("Standard"),
+            Preset::Mobile => tl!("Mobile"),
+        };
+        let current = Preset::of(&d.settings);
+        egui::ComboBox::from_id_salt("optimize-preset").selected_text(current.map_or(tl!("Custom"), name)).show_ui(ui, |ui| {
+            for p in Preset::ALL {
+                if ui.selectable_label(current == Some(p), name(p)).clicked() {
+                    d.settings = p.settings();
+                }
+            }
+        });
+    });
+    ui.add_space(6.0);
+    ui.horizontal_wrapped(|ui| {
         for (tab, label) in [
             (OptimizeTab::Images, tl!("Images")),
             (OptimizeTab::DiscardObjects, tl!("Discard Objects")),
@@ -176,6 +191,7 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
     let s = &mut d.settings;
     match d.tab {
         OptimizeTab::Images => {
+            ui.add(widgets::checkbox(&mut s.merge_fragments, tl!("Merge image fragments")));
             image_row(ui, "color", "Color Images", &mut s.color);
             image_row(ui, "gray", "Grayscale Images", &mut s.gray);
             ui.label(
@@ -186,10 +202,10 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
         }
         OptimizeTab::DiscardObjects => {
             discard_box(ui, &mut d.discard, Hidden::LinksActionsScripts, "Discard all links, actions and JavaScript");
-            ui.checkbox(&mut s.discard_alternate_images, tl!("Discard alternate images"));
-            ui.checkbox(&mut s.discard_thumbnails, tl!("Discard embedded page thumbnails"));
-            ui.checkbox(&mut s.discard_tags, tl!("Discard document tags"));
-            ui.checkbox(&mut s.discard_print_settings, tl!("Discard embedded print settings"));
+            ui.add(widgets::checkbox(&mut s.discard_alternate_images, tl!("Discard alternate images")));
+            ui.add(widgets::checkbox(&mut s.discard_thumbnails, tl!("Discard embedded page thumbnails")));
+            ui.add(widgets::checkbox(&mut s.discard_tags, tl!("Discard document tags")));
+            ui.add(widgets::checkbox(&mut s.discard_print_settings, tl!("Discard embedded print settings")));
             discard_box(ui, &mut d.discard, Hidden::Bookmarks, "Discard bookmarks");
             discard_box(ui, &mut d.discard, Hidden::FormFields, "Flatten form fields");
             discard_box(ui, &mut d.discard, Hidden::HiddenLayers, "Discard hidden layer content");
@@ -202,11 +218,11 @@ pub(crate) fn body(ui: &mut egui::Ui, d: &mut OptimizeDraft, t: &Tokens) -> (boo
             discard_box(ui, &mut d.discard, Hidden::HiddenText, "Discard hidden text");
         }
         OptimizeTab::CleanUp => {
-            ui.checkbox(&mut s.flate_unencoded, tl!("Use Flate to encode streams that are not encoded"));
-            ui.checkbox(&mut s.remove_invalid_links, tl!("Remove invalid links and bookmarks"));
-            ui.checkbox(&mut s.remove_unreferenced_dests, tl!("Remove unreferenced named destinations"));
-            ui.add_enabled(false, egui::Checkbox::new(&mut true, tl!("Compress document structure (object streams)")));
-            ui.add_enabled(false, egui::Checkbox::new(&mut true, tl!("Remove unused objects and merge identical ones")));
+            ui.add(widgets::checkbox(&mut s.flate_unencoded, tl!("Use Flate to encode streams that are not encoded")));
+            ui.add(widgets::checkbox(&mut s.remove_invalid_links, tl!("Remove invalid links and bookmarks")));
+            ui.add(widgets::checkbox(&mut s.remove_unreferenced_dests, tl!("Remove unreferenced named destinations")));
+            ui.add_enabled(false, widgets::checkbox(&mut true, tl!("Compress document structure (object streams)")));
+            ui.add_enabled(false, widgets::checkbox(&mut true, tl!("Remove unused objects and merge identical ones")));
         }
     }
     ui.add_space(12.0);
@@ -282,7 +298,7 @@ impl PdfCraftApp {
         }
         let job = match self.session.optimize_job(id, settings, discard) {
             Ok(job) => job,
-            Err(e) => return self.save_optimized(id, kind.suffix(), Err(e)),
+            Err(e) => return self.save_optimized(id, kind, Err(e)),
         };
         let progress = Arc::new(Mutex::new(OptimizeProgress::default()));
         let p = progress.clone();
@@ -352,7 +368,7 @@ impl PdfCraftApp {
                     let detail = if kind == OptimizeKind::Advanced { summary(&r) } else { String::new() };
                     (b, detail)
                 });
-                self.save_optimized(doc, kind.suffix(), result);
+                self.save_optimized(doc, kind, result);
             }
         }
     }
