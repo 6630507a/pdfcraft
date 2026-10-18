@@ -4116,21 +4116,20 @@ impl Session {
         let rewrite = editor.cos.full_save_required() || editor.cos.encryption_changed() || editor.cos.revisions().is_empty();
         guard(|| {
             if on_saved || rewrite {
-                return write_incremental(&editor.cos, &opts);
+                return write_incremental(&editor.cos, &opts).map(Arc::new);
             }
             let mut base = pdfcraft_cos::Document::open_with_password(editor.saved.clone(), editor.saved_keys.reopen.as_deref())?;
             if base.overlay_changes_from(&editor.cos)? {
-                write_incremental(&base, &opts)
+                write_incremental(&base, &opts).map(Arc::new)
             } else if !editor.cos.is_modified() {
-                Ok(editor.cos.bytes().to_vec())
+                Ok(editor.cos.bytes().clone())
             } else {
                 // Undo restored security from before the last save: append the snapshot to its
                 // own source, which it hasn't changed security against.
-                write_incremental(&editor.cos, &opts)
+                write_incremental(&editor.cos, &opts).map(Arc::new)
             }
         })
         .map_err(EditError::Write)?
-        .map(Arc::new)
         .map_err(|e| EditError::Write(e.to_string()))
     }
 
