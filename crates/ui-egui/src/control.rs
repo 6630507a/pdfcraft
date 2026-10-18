@@ -1233,8 +1233,10 @@ mod transport_tests {
     #[test]
     fn a_lingering_connection_holds_no_place_to_authenticate() {
         use std::io::{BufReader, Write};
+        // A linger far longer than the checks below take, even on a loaded machine.
+        let limits = super::Limits { linger: std::time::Duration::from_secs(5), ..TEST_LIMITS };
         let (_control, client) = super::attach(&egui::Context::default());
-        let ep = super::serve_with(client, TEST_LIMITS).unwrap();
+        let ep = super::serve_with(client, limits).unwrap();
         let auth = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "auth", "params": { "token": ep.token } });
         // Refused with most of its line unread, and left open: it lingers for `linger`.
         let refused = connect(ep.port);
@@ -1243,14 +1245,14 @@ mod transport_tests {
         assert_eq!(next_line(&mut r).expect("refused with a reason")["error"]["code"], -32600);
         // Well within the linger, both places are free for new connections.
         let started = std::time::Instant::now();
-        let others: Vec<_> = (0..TEST_LIMITS.max_unauthenticated).map(|_| connect(ep.port)).collect();
+        let others: Vec<_> = (0..limits.max_unauthenticated).map(|_| connect(ep.port)).collect();
         for s in &others {
             // A refused one has already been closed, so its write may fail; its reply says why.
             let _ = writeln!(s.try_clone().unwrap(), "{auth}");
             let reply = next_line(&mut BufReader::new(s.try_clone().unwrap())).expect("a reply");
             assert_eq!(reply["result"]["ok"], true, "admitted while the refused one lingers: {reply}");
         }
-        assert!(started.elapsed() < TEST_LIMITS.linger, "checked while it lingered: {:?}", started.elapsed());
+        assert!(started.elapsed() < limits.linger, "checked while it lingered: {:?}", started.elapsed());
         drop(refused);
     }
 
@@ -1260,7 +1262,8 @@ mod transport_tests {
     #[test]
     fn only_so_many_refused_connections_linger() {
         use std::io::{BufReader, Write};
-        let limits = super::Limits { max_lingering: 1, ..TEST_LIMITS };
+        // A linger far longer than the checks below take, even on a loaded machine.
+        let limits = super::Limits { linger: std::time::Duration::from_secs(5), max_lingering: 1, ..TEST_LIMITS };
         let (_control, client) = super::attach(&egui::Context::default());
         let ep = super::serve_with(client, limits).unwrap();
         let bad = r#"{"jsonrpc": "2.0", "id": 1, "method": "page_count"}"#;
