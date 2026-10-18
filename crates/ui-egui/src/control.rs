@@ -793,11 +793,18 @@ struct Limits {
     max_unauthenticated: usize,
     /// How long a write may block on a client that never reads its replies.
     write_timeout: std::time::Duration,
+    /// How long a connection refused after a reply is kept half-open, discarding input, so the
+    /// reply is not lost to a reset (see [`close_after_reply`]).
+    linger: std::time::Duration,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-const LIMITS: Limits =
-    Limits { auth_deadline: std::time::Duration::from_secs(10), max_unauthenticated: 8, write_timeout: std::time::Duration::from_secs(30) };
+const LIMITS: Limits = Limits {
+    auth_deadline: std::time::Duration::from_secs(10),
+    max_unauthenticated: 8,
+    write_timeout: std::time::Duration::from_secs(30),
+    linger: std::time::Duration::from_secs(1),
+};
 
 /// One of the [`Limits::max_unauthenticated`] places, given back when dropped: when the
 /// connection authenticates, and on every way its thread can end.
@@ -850,6 +857,22 @@ impl std::io::Read for Reading {
     }
 }
 
+/// Close a connection whose last reply has just been written without losing that reply.
+///
+/// Closing a socket with input still unread makes the kernel send a reset instead of a FIN, and
+/// the reset can discard the reply before the client reads it (Linux does): a client still
+/// sending when it is refused would never learn why. So send FIN first, then read and discard
+/// whatever arrives until the client closes its side or `linger` passes, and only then close.
+#[cfg(not(target_arch = "wasm32"))]
+fn close_after_reply(reading: &mut Reading, linger: std::time::Duration) {
+    use std::io::Read;
+    let _ = reading.stream.shutdown(std::net::Shutdown::Write);
+    reading.until = Some(std::time::Instant::now() + linger);
+    let mut sink = [0u8; 1024];
+    // Each read is bounded by the time left, and none is made once `linger` has passed.
+    while matches!(reading.read(&mut sink), Ok(n) if n > 0) {}
+}
+
 /// Listen on `127.0.0.1` (random port) and forward authenticated requests to `client`.
 ///
 /// Protocol: newline-delimited JSON-RPC 2.0. The first request on a connection must be
@@ -899,14 +922,18 @@ fn serve_with(client: ControlClient, limits: Limits) -> std::io::Result<Endpoint
                         Err(e) if !authed && matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
                             let secs = limits.auth_deadline.as_secs_f64();
                             let e = rpc_error(Value::Null, -32004, &format!("not authenticated within {secs} s"));
-                            let _ = writeln!(write, "{e}").and_then(|_| write.flush());
+                            if writeln!(write, "{e}").and_then(|_| write.flush()).is_ok() {
+                                close_after_reply(reader.get_mut(), limits.linger);
+                            }
                             break;
                         }
                         // End of stream or a failed read ends the connection, as before.
                         Ok(LineRead::End) | Err(_) => break,
                         Ok(LineRead::TooLong) => {
                             let e = rpc_error(Value::Null, -32600, &format!("request line longer than {max} bytes before auth"));
-                            let _ = writeln!(write, "{e}").and_then(|_| write.flush());
+                            if writeln!(write, "{e}").and_then(|_| write.flush()).is_ok() {
+                                close_after_reply(reader.get_mut(), limits.linger);
+                            }
                             break;
                         }
                     }
@@ -945,7 +972,11 @@ fn serve_with(client: ControlClient, limits: Limits) -> std::io::Result<Endpoint
                             }
                         }
                     };
-                    if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() || close {
+                    if writeln!(write, "{reply}").and_then(|_| write.flush()).is_err() {
+                        break;
+                    }
+                    if close {
+                        close_after_reply(reader.get_mut(), limits.linger);
                         break;
                     }
                 }
@@ -1089,6 +1120,7 @@ mod transport_tests {
         auth_deadline: std::time::Duration::from_millis(300),
         max_unauthenticated: 2,
         write_timeout: std::time::Duration::from_secs(5),
+        linger: std::time::Duration::from_secs(1),
     };
 
     /// The next line the server sends, as JSON, or `None` when it closed the connection instead.
@@ -1144,6 +1176,26 @@ mod transport_tests {
         assert!(took < std::time::Duration::from_secs(2), "the deadline is absolute: {took:?}");
         drop(r);
         drip.join().unwrap();
+    }
+
+    /// A client refused while the server still has its input unread gets the reason, not a
+    /// reset: closing on top of unread input sends a reset, which can discard the reply before
+    /// the client reads it (Linux does). Here a line far over the limit leaves most of itself
+    /// unread when the server refuses it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_client_refused_with_input_unread_gets_the_reason() {
+        use std::io::{BufReader, Write};
+        let (_control, client) = super::attach(&egui::Context::default());
+        let ep = super::serve_with(client, TEST_LIMITS).unwrap();
+        let s = connect(ep.port);
+        let mut w = s.try_clone().unwrap();
+        w.write_all(&vec![b'x'; 16 * super::MAX_AUTH_LINE]).unwrap();
+        // Let the server refuse it (and, before the fix, close) before reading the reply.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut r = BufReader::new(s);
+        let reply = next_line(&mut r).expect("the server says why before closing");
+        assert_eq!(reply["error"]["code"], -32600, "{reply}");
     }
 
     /// #1806: only so many connections may wait to authenticate at once. One more is refused
